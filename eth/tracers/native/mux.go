@@ -24,10 +24,11 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/tracers"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 func init() {
-	tracers.DefaultDirectory.Register("muxTracer", newMuxTracer, false)
+	tracers.DefaultDirectory.Register("muxTracer", newMuxTracerFromConfig, false)
 }
 
 // muxTracer is a go implementation of the Tracer interface which
@@ -37,25 +38,32 @@ type muxTracer struct {
 	tracers []*tracers.Tracer
 }
 
-// newMuxTracer returns a new mux tracer.
-func newMuxTracer(ctx *tracers.Context, cfg json.RawMessage) (*tracers.Tracer, error) {
+// newMuxTracerFromConfig returns a new mux tracer.
+func newMuxTracerFromConfig(ctx *tracers.Context, cfg json.RawMessage, chainConfig *params.ChainConfig) (*tracers.Tracer, error) {
 	var config map[string]json.RawMessage
-	if cfg != nil {
-		if err := json.Unmarshal(cfg, &config); err != nil {
-			return nil, err
-		}
+	if err := json.Unmarshal(cfg, &config); err != nil {
+		return nil, err
 	}
 	objects := make([]*tracers.Tracer, 0, len(config))
 	names := make([]string, 0, len(config))
 	for k, v := range config {
-		t, err := tracers.DefaultDirectory.New(k, ctx, v)
+		t, err := tracers.DefaultDirectory.New(k, ctx, v, chainConfig)
 		if err != nil {
 			return nil, err
 		}
 		objects = append(objects, t)
 		names = append(names, k)
 	}
+	return NewMuxTracer(names, objects)
+}
 
+// NewMuxTracer creates a multiplexing tracer that fans out tracing hooks to
+// multiple child tracers. Each hook invocation is forwarded to all children,
+// in the order they are provided.
+//
+// The names parameter associates a label with each tracer, used as keys in
+// the aggregated JSON result returned by GetResult.
+func NewMuxTracer(names []string, objects []*tracers.Tracer) (*tracers.Tracer, error) {
 	t := &muxTracer{names: names, tracers: objects}
 	return &tracers.Tracer{
 		Hooks: &tracing.Hooks{
@@ -153,6 +161,14 @@ func (t *muxTracer) OnCodeChange(a common.Address, prevCodeHash common.Hash, pre
 	for _, t := range t.tracers {
 		if t.OnCodeChange != nil {
 			t.OnCodeChange(a, prevCodeHash, prev, codeHash, code)
+		}
+	}
+}
+
+func (t *muxTracer) OnCodeChangeV2(a common.Address, prevCodeHash common.Hash, prev []byte, codeHash common.Hash, code []byte, reason tracing.CodeChangeReason) {
+	for _, t := range t.tracers {
+		if t.OnCodeChangeV2 != nil {
+			t.OnCodeChangeV2(a, prevCodeHash, prev, codeHash, code, reason)
 		}
 	}
 }

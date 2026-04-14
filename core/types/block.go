@@ -18,6 +18,7 @@
 package types
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core/types/bal"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
@@ -94,6 +96,15 @@ type Header struct {
 
 	// ParentBeaconRoot was added by EIP-4788 and is ignored in legacy headers.
 	ParentBeaconRoot *common.Hash `json:"parentBeaconBlockRoot" rlp:"optional"`
+
+	// RequestsHash was added by EIP-7685 and is ignored in legacy headers.
+	RequestsHash *common.Hash `json:"requestsHash" rlp:"optional"`
+
+	// BlockAccessListHash was added by EIP-7928 and is ignored in legacy headers.
+	BlockAccessListHash *common.Hash `json:"balHash" rlp:"optional"`
+
+	// SlotNumber was added by EIP-7843 and is ignored in legacy headers.
+	SlotNumber *uint64 `json:"slotNumber" rlp:"optional"`
 }
 
 // field type overrides for gencodec
@@ -108,6 +119,7 @@ type headerMarshaling struct {
 	Hash          common.Hash `json:"hash"` // adds call to Hash() in MarshalJSON
 	BlobGasUsed   *hexutil.Uint64
 	ExcessBlobGas *hexutil.Uint64
+	SlotNumber    *hexutil.Uint64
 }
 
 // Hash returns the block hash of the header, which is simply the keccak256 hash of its
@@ -116,7 +128,7 @@ func (h *Header) Hash() common.Hash {
 	return rlpHash(h)
 }
 
-var headerSize = common.StorageSize(reflect.TypeOf(Header{}).Size())
+var headerSize = common.StorageSize(reflect.TypeFor[Header]().Size())
 
 // Size returns the approximate memory used by all internal contents. It is used
 // to approximate and limit the memory consumption of various caches.
@@ -155,10 +167,10 @@ func (h *Header) SanityCheck() error {
 // EmptyBody returns true if there is no additional 'body' to complete the header
 // that is: no transactions, no uncles and no withdrawals.
 func (h *Header) EmptyBody() bool {
-	if h.WithdrawalsHash != nil {
-		return h.TxHash == EmptyTxsHash && *h.WithdrawalsHash == EmptyWithdrawalsHash
-	}
-	return h.TxHash == EmptyTxsHash && h.UncleHash == EmptyUncleHash
+	var (
+		emptyWithdrawals = h.WithdrawalsHash == nil || *h.WithdrawalsHash == EmptyWithdrawalsHash
+	)
+	return h.TxHash == EmptyTxsHash && h.UncleHash == EmptyUncleHash && emptyWithdrawals
 }
 
 // EmptyReceipts returns true if there are no receipts for this header/block.
@@ -196,6 +208,7 @@ type Block struct {
 	uncles       []*Header
 	transactions Transactions
 	withdrawals  Withdrawals
+	accessList   *bal.BlockAccessList
 
 	// caches
 	hash atomic.Pointer[common.Hash]
@@ -220,7 +233,10 @@ type extblock struct {
 //
 // The body elements and the receipts are used to recompute and overwrite the
 // relevant portions of the header.
-func NewBlock(header *Header, body *Body, receipts []*Receipt, hasher TrieHasher) *Block {
+//
+// The receipt's bloom must already calculated for the block's bloom to be
+// correctly calculated.
+func NewBlock(header *Header, body *Body, receipts []*Receipt, hasher ListHasher) *Block {
 	if body == nil {
 		body = &Body{}
 	}
@@ -243,7 +259,10 @@ func NewBlock(header *Header, body *Body, receipts []*Receipt, hasher TrieHasher
 		b.header.ReceiptHash = EmptyReceiptsHash
 	} else {
 		b.header.ReceiptHash = DeriveSha(Receipts(receipts), hasher)
-		b.header.Bloom = CreateBloom(receipts)
+		// Receipts must go through MakeReceipt to calculate the receipt's bloom
+		// already. Merge the receipt's bloom together instead of recalculating
+		// everything.
+		b.header.Bloom = MergeBloom(receipts)
 	}
 
 	if len(uncles) == 0 {
@@ -302,6 +321,18 @@ func CopyHeader(h *Header) *Header {
 		cpy.ParentBeaconRoot = new(common.Hash)
 		*cpy.ParentBeaconRoot = *h.ParentBeaconRoot
 	}
+	if h.RequestsHash != nil {
+		cpy.RequestsHash = new(common.Hash)
+		*cpy.RequestsHash = *h.RequestsHash
+	}
+	if h.BlockAccessListHash != nil {
+		cpy.BlockAccessListHash = new(common.Hash)
+		*cpy.BlockAccessListHash = *h.BlockAccessListHash
+	}
+	if h.SlotNumber != nil {
+		cpy.SlotNumber = new(uint64)
+		*cpy.SlotNumber = *h.SlotNumber
+	}
 	return &cpy
 }
 
@@ -336,9 +367,10 @@ func (b *Block) Body() *Body {
 // Accessors for body data. These do not return a copy because the content
 // of the body slices does not affect the cached hash/size in block.
 
-func (b *Block) Uncles() []*Header          { return b.uncles }
-func (b *Block) Transactions() Transactions { return b.transactions }
-func (b *Block) Withdrawals() Withdrawals   { return b.withdrawals }
+func (b *Block) Uncles() []*Header                { return b.uncles }
+func (b *Block) Transactions() Transactions       { return b.transactions }
+func (b *Block) Withdrawals() Withdrawals         { return b.withdrawals }
+func (b *Block) AccessList() *bal.BlockAccessList { return b.accessList }
 
 func (b *Block) Transaction(hash common.Hash) *Transaction {
 	for _, transaction := range b.transactions {
@@ -381,7 +413,8 @@ func (b *Block) BaseFee() *big.Int {
 	return new(big.Int).Set(b.header.BaseFee)
 }
 
-func (b *Block) BeaconRoot() *common.Hash { return b.header.ParentBeaconRoot }
+func (b *Block) BeaconRoot() *common.Hash   { return b.header.ParentBeaconRoot }
+func (b *Block) RequestsHash() *common.Hash { return b.header.RequestsHash }
 
 func (b *Block) ExcessBlobGas() *uint64 {
 	var excessBlobGas *uint64
@@ -399,6 +432,15 @@ func (b *Block) BlobGasUsed() *uint64 {
 		*blobGasUsed = *b.header.BlobGasUsed
 	}
 	return blobGasUsed
+}
+
+func (b *Block) SlotNumber() *uint64 {
+	var slotNum *uint64
+	if b.header.SlotNumber != nil {
+		slotNum = new(uint64)
+		*slotNum = *b.header.SlotNumber
+	}
+	return slotNum
 }
 
 // Size returns the true RLP encoded storage size of the block, either by encoding
@@ -433,6 +475,21 @@ func CalcUncleHash(uncles []*Header) common.Hash {
 	return rlpHash(uncles)
 }
 
+// CalcRequestsHash creates the block requestsHash value for a list of requests.
+func CalcRequestsHash(requests [][]byte) common.Hash {
+	h1, h2 := sha256.New(), sha256.New()
+	var buf common.Hash
+	for _, item := range requests {
+		if len(item) > 1 { // skip items with only requestType and no data.
+			h1.Reset()
+			h1.Write(item)
+			h2.Write(h1.Sum(buf[:0]))
+		}
+	}
+	h2.Sum(buf[:0])
+	return buf
+}
+
 // NewBlockWithHeader creates a block with the given header data. The
 // header data is copied, changes to header and to the field values
 // will not affect the block.
@@ -448,6 +505,7 @@ func (b *Block) WithSeal(header *Header) *Block {
 		transactions: b.transactions,
 		uncles:       b.uncles,
 		withdrawals:  b.withdrawals,
+		accessList:   b.accessList,
 	}
 }
 
@@ -459,11 +517,30 @@ func (b *Block) WithBody(body Body) *Block {
 		transactions: slices.Clone(body.Transactions),
 		uncles:       make([]*Header, len(body.Uncles)),
 		withdrawals:  slices.Clone(body.Withdrawals),
+		accessList:   b.accessList,
 	}
 	for i := range body.Uncles {
 		block.uncles[i] = CopyHeader(body.Uncles[i])
 	}
 	return block
+}
+
+// WithAccessList returns a copy of the block with the given access list embedded.
+func (b *Block) WithAccessList(accessList *bal.BlockAccessList) *Block {
+	return b.WithAccessListUnsafe(accessList.Copy())
+}
+
+// WithAccessListUnsafe returns a copy of the block with the given access list
+// embedded. Note that the access list is not deep-copied; use WithAccessList
+// if the provided list may be modified by other actors.
+func (b *Block) WithAccessListUnsafe(accessList *bal.BlockAccessList) *Block {
+	return &Block{
+		header:       b.header,
+		transactions: b.transactions,
+		uncles:       b.uncles,
+		withdrawals:  b.withdrawals,
+		accessList:   accessList,
+	}
 }
 
 // Hash returns the keccak256 hash of b's header.

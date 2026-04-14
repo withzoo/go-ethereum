@@ -51,8 +51,12 @@ type ErrStackUnderflow struct {
 	required int
 }
 
-func (e *ErrStackUnderflow) Error() string {
+func (e ErrStackUnderflow) Error() string {
 	return fmt.Sprintf("stack underflow (%d <=> %d)", e.stackLen, e.required)
+}
+
+func (e ErrStackUnderflow) Unwrap() error {
+	return errors.New("stack underflow")
 }
 
 // ErrStackOverflow wraps an evm error when the items on the stack exceeds
@@ -62,16 +66,26 @@ type ErrStackOverflow struct {
 	limit    int
 }
 
-func (e *ErrStackOverflow) Error() string {
+func (e ErrStackOverflow) Error() string {
 	return fmt.Sprintf("stack limit reached %d (%d)", e.stackLen, e.limit)
+}
+
+func (e ErrStackOverflow) Unwrap() error {
+	return errors.New("stack overflow")
 }
 
 // ErrInvalidOpCode wraps an evm error when an invalid opcode is encountered.
 type ErrInvalidOpCode struct {
-	opcode OpCode
+	opcode  OpCode
+	operand *byte
 }
 
-func (e *ErrInvalidOpCode) Error() string { return fmt.Sprintf("invalid opcode: %s", e.opcode) }
+func (e *ErrInvalidOpCode) Error() string {
+	if e.operand != nil {
+		return fmt.Sprintf("invalid opcode: %s (operand: 0x%02x)", e.opcode, *e.operand)
+	}
+	return fmt.Sprintf("invalid opcode: %s", e.opcode)
+}
 
 // rpcError is the same interface as the one defined in rpc/errors.go
 // but we do not want to depend on rpc package here so we redefine it.
